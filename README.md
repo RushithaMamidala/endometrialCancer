@@ -1,4 +1,25 @@
-# endometrialCancer
+# EndometrialCancer
+
+To extract key clinical findings from a list of paths in a csv.
+```
+python3 -u run_pipe.py --model_name_or_path ${MODEL} --train_file figo_paths.csv --do_gen --report
+```
+
+Preprocess the clinical fings before restaging:
+```
+python3 -u run_pipe.py --model_name_or_path ${MODEL} --train_file figo_paths.csv --do_gen --process_findings
+```
+
+ICL based restaging
+```
+python3 -u run_pipe.py --model_name_or_path ${MODEL} --train_file figo_paths.csv --do_gen --restage
+```
+
+RetoMaton based restaging
+```
+python3 -u run_pipe.py --model_name_or_path ${MODEL} --train_file figo_paths.csv --do_gen --restage --retomaton --dstore_size 202751 --dstore_dir checkpoints/${MODEL} --lmbda 0.15 --k 512
+```
+
 To extract the text from American Cancer Society recommendation
 ```
 python guidelineExtractors/acs.py
@@ -52,5 +73,5 @@ MODEL=openai/gpt-oss-20b
 
 python3 -u run_recomm.py --model_name_or_path ${MODEL} --train_file path_reports_dataset.csv --output_dir recommendations/ --eval_subset train --do_gen --dstore_dir checkpoints/${MODEL} --dstore_size 15359 --retomaton --lmbda 0.1 --report
 ```
-
+Dstore with basecases imporved - 202751
 Dstore with basecases - 118783
