@@ -11,6 +11,8 @@ from enum import Enum, auto
 from pathlib import Path
 import glob
 from itertools import zip_longest
+from transformers.generation import utils
+from transformers import AutoTokenizer
 
 from tqdm import tqdm
 
@@ -30,13 +32,24 @@ class RetomatonWrapper(KNNWrapper):
         self.no_pointer = no_pointer
         self.min_knns = min_knns
         self.max_knns = max_knns
+        self.do_gen = False
+        self.no_lookup_counter_history = []
+        self.tokenizer = AutoTokenizer.from_pretrained('openai/gpt-oss-20b')
 
+    def load_retomaton(self, members=None):
         if members is None:
             available_member_files = glob.glob(f'{self.dstore_dir}/members*')
             if len(available_member_files) == 0:
                 logger.info(f'No member files found in {self.dstore_dir}, not using clustering')
             else:
-                members = available_member_files[0]
+                if len(available_member_files) > 0:
+                    for member in available_member_files:
+                        if str(self.dstore_size)+'_' in member:
+                            members = member
+                            break
+
+                else:
+                    members = available_member_files[0]
                 logger.info(f'Found the following cluster members files: {available_member_files}')
                 logger.info(f'Using members file {members}')
         
@@ -48,22 +61,110 @@ class RetomatonWrapper(KNNWrapper):
             members_for_indices = np.nonzero(self.members[np.arange(self.members.shape[0])])
             self.cluster = torch.zeros((self.dstore_size, ), dtype=torch.int32).to(self.device)
             self.cluster[members_for_indices[1]] = torch.from_numpy(members_for_indices[0]).to(self.device)
+        
+        if self.do_gen:
+            self.generate_cur_knns = None
+            self.no_lookup_counter = 0
+            
+        else:
+            self.generate_cur_knns = torch.tensor([], dtype=torch.int64)
+            self.generate_cur_dists = torch.tensor([], dtype=torch.float32)
 
-        self.generate_cur_knns = torch.tensor([], dtype=torch.int64)
-        self.generate_cur_dists = torch.tensor([], dtype=torch.float32)
-        self.no_lookup_counter_history = []
+    def pre_forward_hook(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        if labels is None: # generation
+            self.labels = input_ids.to(self.device)
+        else:
+            self.labels = labels.to(self.device) 
+        return self.original_forward_func(input_ids=input_ids, labels=labels, attention_mask=attention_mask, **kwargs)
 
     def post_forward_hook(self, module, input, output):
+        batch, time_dim, vocab_size = output.shape
         shift = 0 if self.is_encoder_decoder else 1
-        if self.labels is None:
-            # In "generate" mode, we don't support yet tracking of the beam search hypotheses across time,
-            # which we need to track in order to implement RetoMaton correctly. 
-            # In the meantime, use kNN-LM's generate
-            return super().post_forward_hook(module, input, output)
-
         lm_logits = output
         lm_logits = torch.nn.functional.log_softmax(lm_logits, dim=-1) # (batch, time, vocab)
-        queries = self.activation_capturer.captured # (batch, time, dim) 
+        queries = self.activation_capturer.captured.to(torch.float32) # (batch, time, dim) 
+
+        if self.do_gen:
+            if self.labels.shape[1]>1:
+                # New batch for generation. Emptying the pointers and neighbors
+                self.generate_cur_knns = [] #torch.tensor([], dtype=torch.int64)
+            else:
+                order = utils.get_retoMaton_beam_idx() # fetching order of beams from beam seach
+                # Reorder the order of neighbors to match the beam
+                reordered_curr_knns = [self.generate_cur_knns[i] for i in order]
+                reordered_vals_at_knns = [self.all_vals_at_knns[i] for i in order]
+                self.generate_cur_knns = reordered_curr_knns
+                self.all_vals_at_knns =  reordered_vals_at_knns
+                # Labels hold the token prediction of previous timestep.
+                # If that matches the vals of the knns then it's a valid neighbnor to explore.
+                for idx, (lab, vals) in enumerate(zip(self.labels, self.all_vals_at_knns)):
+                    knns = self.generate_cur_knns[idx]
+                    # logger.info(f'Beam {idx} Neighbour: "{self.tokenizer.decode((self.vals[knns.squeeze(0)[0]]))}"')
+                    # logger.info(f'KNNS: {self.vals[knns.squeeze(0)]}')
+                    vals_are_correct_and_pointer_available = (vals == lab) & (knns < self.dstore_size - 1)
+                    self.generate_cur_knns[idx] = knns[vals_are_correct_and_pointer_available]
+                    # logger.info(f'self.generate_cur_knns[idx]: {self.vals[self.generate_cur_knns[idx]]}, labels = {self.labels}')
+                    # logger.info(f'Beam {idx} Neighbour: "{self.tokenizer.decode((self.vals[self.generate_cur_knns[idx]]))}"')
+                    # logger.info(f'Beam {idx} Neighbour: {self.tokenizer.decode((self.vals[self.generate_cur_knns[idx].squeeze(0)[1]-10:self.generate_cur_knns[idx].squeeze(0)[1]].squeeze()))}"{self.tokenizer.decode((self.vals[self.generate_cur_knns[idx].squeeze(0)[1]]))}"')
+                
+            nonpad_mask = torch.cat([
+                torch.zeros([batch, time_dim - 1], dtype=torch.bool),
+                torch.ones([batch, 1], dtype=torch.bool),
+            ], axis=-1).to(self.device)
+
+            captured_labels = None
+            queries = queries[nonpad_mask] # (nonpad, dim)
+            lm_logits = lm_logits[nonpad_mask] # (nonpad, vocab)
+
+            all_knn_probs = []
+            self.all_vals_at_knns = []
+            
+            for idx, timestep_query in enumerate(queries):
+                perform_search = False
+                extended_pointers = None
+                if len(self.generate_cur_knns)<queries.shape[0]: # at first timestep filling the list of neighbors
+                    cur_knns = torch.tensor([], dtype=torch.int64)
+                else:
+                    temp_knns = self.generate_cur_knns[idx]
+                    valid_mask = temp_knns != -1
+                    cur_knns = temp_knns[valid_mask]
+                pointers = cur_knns + 1 # go to next entry usign pointer
+                if (pointers == self.dstore_size).any():
+                    pointers[pointers == self.dstore_size] = self.dstore_size-1
+                if self.no_pointer or cur_knns.numel() < self.min_knns: # too few neighbors
+                    perform_search = True
+                    self.no_lookup_counter_history.append(self.no_lookup_counter)
+                    self.no_lookup_counter = 0
+                else:
+                    self.no_lookup_counter += 1
+
+                if self.no_pointer:
+                    extended_pointers = None
+                elif pointers.numel() >= self.max_knns:
+                    extended_pointers = pointers[:self.max_knns] # cap max neighbors
+                else:
+                    extended_pointers = self.extend_pointers_using_clusters(pointers) # using valid neighbors extend to the cluster
+                
+                # (vocab_size, ) , (k, ), (k, ), (k, )
+                cur_knn_log_prob, knns, dists, vals_at_knns = self.get_knn_log_prob(
+                    timestep_query, 
+                    pointers=extended_pointers,
+                    perform_search=perform_search)
+                all_knn_probs.append(cur_knn_log_prob)
+                self.all_vals_at_knns.append(vals_at_knns)
+                
+                if not self.no_pointer:
+                    cur_knns = knns[dists.argsort(descending=True)].unsqueeze(0)
+                    if len(self.generate_cur_knns) < queries.shape[0]:
+                        self.generate_cur_knns.append(cur_knns) # 
+                    else:
+                        self.generate_cur_knns[idx] = cur_knns # update neighbors
+            interpolated_scores = KNNWrapper.interpolate(torch.stack(all_knn_probs).bfloat16(), lm_logits, self.lmbda) # (nonpad, vocab)
+            output[nonpad_mask] = interpolated_scores
+            del pointers
+            torch.cuda.empty_cache()
+            return output
+
         
         shifted_labels = self.labels[:, shift:]
         nonpad_mask = torch.cat([
@@ -72,7 +173,7 @@ class RetomatonWrapper(KNNWrapper):
         ], axis=-1)
         captured_labels = shifted_labels[shifted_labels != -100] # (nonpad)
 
-        queries = queries[nonpad_mask] # (nonpad, dim)
+        queries = queries[nonpad_mask].to(torch.float32) # (nonpad, dim)
         lm_logits = lm_logits[nonpad_mask] # (nonpad, vocab)
 
         all_knn_probs = []
@@ -113,7 +214,7 @@ class RetomatonWrapper(KNNWrapper):
                 cur_dists = dists[vals_are_correct_and_pointer_available]
                 cur_knns = cur_knns[cur_dists.argsort(descending=True)]
 
-        interpolated_scores = KNNWrapper.interpolate(torch.stack(all_knn_probs), lm_logits, self.lmbda) # (nonpad, vocab)
+        interpolated_scores = KNNWrapper.interpolate(torch.stack(all_knn_probs).bfloat16(), lm_logits, self.lmbda) # (nonpad, vocab)
         output[nonpad_mask] = interpolated_scores
         return output
 

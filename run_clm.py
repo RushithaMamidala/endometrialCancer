@@ -25,6 +25,7 @@ import itertools
 import logging
 import math
 import os
+import csv
     
 import sys
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ from transformers import (
     MODEL_FOR_CAUSAL_LM_MAPPING,
     AutoConfig,
     AutoModelForCausalLM,
+    Mxfp4Config, 
+    GptOssForCausalLM,
     AutoTokenizer,
     EarlyStoppingCallback,
     HfArgumentParser,
@@ -257,7 +260,8 @@ def main():
     )
 
     log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
+    # logger.setLevel(log_level)
+    logger.setLevel(logging.INFO)
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
@@ -268,11 +272,12 @@ def main():
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
-    logger.info(f"Training/evaluation parameters {training_args}")
-    logger.info(f"kNN parameters {knn_args}")
+    # logger.info(f"Training/evaluation parameters {training_args}")
+    # logger.info(f"kNN parameters {knn_args}")
 
     # Detecting last checkpoint.
     last_checkpoint = None
+    logger.info(f"training_args.output_dir: {training_args.output_dir}")
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
@@ -321,8 +326,8 @@ def main():
         dataset_args = {}
         if data_args.train_file is not None:
             data_files["train"] = data_args.train_file
-        if data_args.validation_file is not None:
-            data_files["validation"] = data_args.validation_file
+        # if data_args.validation_file is not None:
+        #     data_files["validation"] = data_args.validation_file
         extension = (
             data_args.train_file.split(".")[-1]
             if data_args.train_file is not None
@@ -333,25 +338,25 @@ def main():
             dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
         raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir, **dataset_args)
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[:{data_args.validation_split_percentage}%]",
-                cache_dir=model_args.cache_dir,
-                **dataset_args,
-            )
-            raw_datasets["train"] = load_dataset(
-                extension,
-                data_files=data_files,
-                split=f"train[{data_args.validation_split_percentage}%:]",
-                cache_dir=model_args.cache_dir,
-                **dataset_args,
-            )
-
-    if not (training_args.do_train or data_args.eval_subset == 'train'):
-        # If not training and not evaluating on train, we do not need to process it
-        del raw_datasets["train"]
+        # if "validation" not in raw_datasets.keys():
+        #     raw_datasets["validation"] = load_dataset(
+        #         extension,
+        #         data_files=data_files,
+        #         split=f"train[:{data_args.validation_split_percentage}%]",
+        #         cache_dir=model_args.cache_dir,
+        #         **dataset_args,
+        #     )
+        #     raw_datasets["train"] = load_dataset(
+        #         extension,
+        #         data_files=data_files,
+        #         split=f"train[{data_args.validation_split_percentage}%:]",
+        #         cache_dir=model_args.cache_dir,
+        #         **dataset_args,
+        #     )
+    logger.info(f"{raw_datasets}")
+    for split in list(raw_datasets.keys()):
+        if split != data_args.eval_subset:
+            del raw_datasets[split]
 
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -395,10 +400,14 @@ def main():
         )
 
     if model_args.model_name_or_path:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = GptOssForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            device_map= "auto",
+            low_cpu_mem_usage=True,
             config=config,
+            quantization_config=Mxfp4Config(dequantize=True),
+            dtype=torch.bfloat16, 
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
             use_auth_token=True if model_args.use_auth_token else None,
@@ -409,6 +418,14 @@ def main():
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
 
     model.resize_token_embeddings(len(tokenizer))
+    logger.info(f'Model assigned to {model.device}')
+    logger.info(model.hf_device_map)
+    # for name, module in model.named_modules():
+    #     print(name, ":", module)
+    # print(model.base_model.layers)
+    # last_layer_device = model.hf_device_map['model.layers.'+str(len(model.base_model.layers)-1)]
+    # print(last_layer_device)
+    # exit(0)
 
     # Injecting KNN
     dimension = model.config.hidden_size
@@ -420,9 +437,9 @@ def main():
     if training_args.do_train:
         column_names = raw_datasets["train"].column_names
     else:
-        column_names = raw_datasets["validation"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
-
+        column_names = raw_datasets[data_args.eval_subset].column_names
+    text_column_name = "output" if "output" in column_names else column_names[0]
+    print(raw_datasets['train'])
     # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
     tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
 
@@ -435,6 +452,18 @@ def main():
                 "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits before being passed to the model."
             )
         return output
+    def extract_output(example):
+        
+        example['output'] = example['output'][21:-3]
+        return example
+    with training_args.main_process_first(desc="extract output"):
+        tokenized_datasets = raw_datasets.map(
+            extract_output,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="extract output",
+        )
 
     with training_args.main_process_first(desc="dataset map tokenization"):
         tokenized_datasets = raw_datasets.map(
@@ -547,7 +576,7 @@ def main():
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
     if training_args.do_eval:
-        if "validation" not in tokenized_datasets:
+        if data_args.eval_subset not in tokenized_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = lm_datasets[data_args.eval_subset]
         if data_args.max_eval_samples is not None:
@@ -587,6 +616,8 @@ def main():
     
     if knn_wrapper is not None:
         knn_wrapper.break_into(model)
+        if knn_args.retomaton:
+            knn_wrapper.load_retomaton()
 
     # Training
     if training_args.do_train:
@@ -629,6 +660,18 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+
+        mode = 'w'
+        if os.path.exists(training_args.output_dir + '/runs.csv'):
+            mode = 'a'
+        with open(training_args.output_dir + '/runs.csv', mode=mode, newline='', encoding='utf-8') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=['lambda', 'k', 'knn_temp','perplexity'])
+            if mode == 'w':
+                writer.writeheader()
+            writer.writerow({'lambda': knn_args.lmbda, 'k': knn_args.k, 'knn_temp': knn_args.knn_temp,'perplexity':perplexity})
+    
+
+
     
     if data_args.prompt is not None:
         generated_ids = model.generate(tokenizer.encode(data_args.prompt, return_tensors='pt').to(training_args.device), num_beams=5, num_return_sequences=5, do_sample=True)
@@ -643,6 +686,8 @@ def main():
     
     if knn_wrapper is not None:
         knn_wrapper.break_out()
+
+    # print(torch.cuda.memory_summary())
 
 
 if __name__ == "__main__":

@@ -57,7 +57,6 @@ class KNNWrapper(object):
         self.move_dstore_to_mem = move_dstore_to_mem
         self.knn_gpu = knn_gpu and torch.cuda.is_available() and torch.cuda.device_count() > 0
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.prompt_input_ids = None
         self.keys = None
         self.values = None
@@ -89,7 +88,7 @@ class KNNWrapper(object):
             start = time.time()
             co = faiss.GpuClonerOptions()
             co.useFloat16 = True
-            gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, cpu_index, co)
+            gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), torch.cuda.device_count()-1, cpu_index, co)
             logger.info(f'Moving index to GPU took {time.time() - start} s')
         else:
             gpu_index = cpu_index
@@ -98,7 +97,8 @@ class KNNWrapper(object):
         # and reconstructing key vectors given their ids
         # currently, this is implemented only for CPU indexes:
         # https://github.com/facebookresearch/faiss/issues/2181
-        cpu_index.make_direct_map()
+        if self.dstore_size > 4096:
+            cpu_index.make_direct_map()
 
         keys_vals_prefix = get_dstore_path(self.dstore_dir, self.model.config.model_type, self.dstore_size, self.dimension)
         if not self.no_load_keys:
@@ -131,6 +131,8 @@ class KNNWrapper(object):
     def break_into(self, model):
         self.model = model
         model.broken_into = True
+        last_layer_device = model.hf_device_map['model.layers.'+str(len(model.base_model.layers)-1)]
+        self.device = torch.device('cuda:'+str(last_layer_device) if torch.cuda.is_available() else 'cpu')
         self.reconstruct_index, self.index = self.setup_faiss()
         self.is_encoder_decoder = model.config.is_encoder_decoder
 
@@ -157,7 +159,7 @@ class KNNWrapper(object):
         return dists, knns
 
     def pre_forward_hook(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        self.labels = labels
+        self.labels = labels.to(self.device) if labels is not None else labels
         return self.original_forward_func(input_ids=input_ids, labels=labels, attention_mask=attention_mask, **kwargs)
 
     def post_forward_hook(self, module, input, output):
@@ -165,7 +167,7 @@ class KNNWrapper(object):
         shift = 0 if self.is_encoder_decoder else 1
         lm_logits = output
         lm_logits = torch.nn.functional.log_softmax(lm_logits, dim=-1) # (batch, time, vocab)
-        queries = self.activation_capturer.captured # (batch, time, dim)
+        queries = self.activation_capturer.captured.to(torch.float32) # (batch, time, dim)
 
         if self.labels is None:
             nonpad_mask = torch.cat([
@@ -184,12 +186,12 @@ class KNNWrapper(object):
         dists, knns = self.get_knns(queries) # (nonpad batch * time, k)
         if self.recompute_dists:
             knns_vecs = torch.from_numpy(self.keys[knns]).to(self.device)
-            dists = self.dist_func(queries, knns_vecs) 
+            dists = self.dist_func(queries, knns_vecs)
         
         neg_dists = -dists
         knn_log_probs, _ = self.knns_to_log_prob(knns, neg_dists)
         
-        interpolated_scores = KNNWrapper.interpolate(knn_log_probs, lm_logits, self.lmbda) # (nonpad, vocab)
+        interpolated_scores = KNNWrapper.interpolate(knn_log_probs.bfloat16(), lm_logits, self.lmbda) # (nonpad, vocab)
         output[nonpad_mask] = interpolated_scores
         return output 
 
@@ -256,6 +258,18 @@ class KNNWrapper(object):
             KEY_TYPE.last_ffn_input: (lambda model: model.base_model.decoder.layers[-1].fc1, True),
             KEY_TYPE.last_ffn_output: (lambda model: model.base_model.decoder.layers[-1], False),
         },
+        'llama': {
+            KEY_TYPE.last_ffn_input: (lambda model: model.base_model.layers[-1].mlp, True),
+            KEY_TYPE.last_ffn_output: (lambda model: model.base_model.layers[-1], False), 
+        },
+        'qwen2': {
+            KEY_TYPE.last_ffn_input: (lambda model: model.base_model.layers[-1].mlp, True),
+            KEY_TYPE.last_ffn_output: (lambda model: model.base_model.layers[-1], False), 
+        },
+        'gpt_oss': {
+            KEY_TYPE.last_ffn_input: (lambda model: model.base_model.layers[-1].mlp, True),
+            KEY_TYPE.last_ffn_output: (lambda model: model.base_model.layers[-1].mlp, False),
+        },
         'gpt2': {
             KEY_TYPE.last_ffn_input: (lambda model: model.base_model.h[-1].mlp, True),
             KEY_TYPE.last_ffn_output: (lambda model: model.base_model.h[-1], False),
@@ -278,8 +292,6 @@ class KNNSaver(object):
         self.dimension = dimension
         self.knn_keytype = KEY_TYPE.last_ffn_input if knn_keytype is None else knn_keytype
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
         self.model = None
         self.activation_capturer = None
         self.is_encoder_decoder = None
@@ -290,12 +302,14 @@ class KNNSaver(object):
         self.hook_handles = []
 
         logger.info(f'keytype being saved: {self.knn_keytype}')
-        logger.info('Saving fp16')
+        logger.info('Saving bf16')
 
     def break_into(self, model):
         self.model = model
         model.broken_into = True
         self.is_encoder_decoder = model.config.is_encoder_decoder
+        last_layer_device = model.hf_device_map['model.layers.'+str(len(model.base_model.layers)-1)]
+        self.device = torch.device('cuda:'+str(last_layer_device) if torch.cuda.is_available() else 'cpu')
         
         # Inject our activation_capturer to capture the activations at every forward pass
         layer_to_capture_fn, capture_input = KNNWrapper.model_layer_to_capture[model.config.model_type][self.knn_keytype]
@@ -326,7 +340,7 @@ class KNNSaver(object):
     def pre_forward_hook(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         if labels is None:
             raise ValueError('labels must be provided when saving a datastore. Are you using --predict_with_generate by mistake? If so, disable it')
-        self.labels = labels
+        self.labels = labels.to(self.device)
         return self.original_forward_func(input_ids=input_ids, labels=labels, attention_mask=attention_mask, **kwargs)
 
     def post_forward_hook(self, module, input, output):
@@ -338,7 +352,7 @@ class KNNSaver(object):
         captured_values = self.labels[:, shift:].flatten(0, 1) # (batch * time)
 
         nonpad_mask = captured_values != -100
-        keys = captured_keys[nonpad_mask]
+        keys = captured_keys[nonpad_mask].to(torch.float16)
         values = captured_values[nonpad_mask]
 
         batch_time_size = keys.shape[0]
@@ -348,6 +362,9 @@ class KNNSaver(object):
             keys = keys[:batch_time_size]
             values = values[:batch_time_size]
         try:
+            # if self.dstore_keys == None:
+            #     self.dstore_keys = keys
+            #     self.dstore_vals = Vals
             self.dstore_keys[self.dstore_idx:(batch_time_size + self.dstore_idx)] = keys.cpu().numpy().astype(np.float16)
             self.dstore_vals[self.dstore_idx:(batch_time_size + self.dstore_idx)] = values.unsqueeze(-1).cpu().numpy().astype(np.int32)
         except ValueError as ex:
@@ -377,34 +394,40 @@ class KNNSaver(object):
         
         # Initialize faiss index
         quantizer = faiss.IndexFlatL2(self.dimension)
-        index = faiss.IndexIVFPQ(quantizer, self.dimension,
-            ncentroids, code_size, 8)
-        index.nprobe = probe
+        if self.dstore_size < 4096:
+            start = 0
+            start_time = time.time()
+            index = faiss.IndexFlatL2(self.dimension)
+            index.add(torch.tensor(self.dstore_keys.astype(np.float32)))
+        else:
+            index = faiss.IndexIVFPQ(quantizer, self.dimension,
+                ncentroids, code_size, 8)
+            index.nprobe = probe
 
-        logger.info('Training Index')
-        np.random.seed(seed)
-        random_sample = np.random.choice(np.arange(self.dstore_vals.shape[0]), size=[min(1000000, self.dstore_vals.shape[0])], replace=False)
-        start = time.time()
-        # Faiss does not handle adding keys in fp16 as of writing this.
-        index.train(self.dstore_keys[random_sample].astype(np.float32))
-        logger.info(f'Training took {time.time() - start} s')
+            logger.info('Training Index')
+            np.random.seed(seed)
+            random_sample = np.random.choice(np.arange(self.dstore_vals.shape[0]), size=[min(1000000, self.dstore_vals.shape[0])], replace=False)
+            start = time.time()
+            # Faiss does not handle adding keys in fp16 as of writing this.
+            index.train(self.dstore_keys[random_sample].astype(np.float32))
+            logger.info(f'Training took {time.time() - start} s')
 
-        logger.info('Adding Keys')
-        # index = faiss.read_index(f'{index_name}.trained')
-        start = 0
-        start_time = time.time()
-        while start < self.dstore_size:
-            end = min(self.dstore_size, start + num_keys_to_add_at_a_time)
-            to_add = self.dstore_keys[start:end].copy()
-            index.add_with_ids(torch.tensor(to_add.astype(np.float32)), torch.arange(start, end))
-            start += num_keys_to_add_at_a_time
+            logger.info('Adding Keys')
+            # index = faiss.read_index(f'{index_name}.trained')
+            start = 0
+            start_time = time.time()
+            while start < self.dstore_size:
+                end = min(self.dstore_size, start + num_keys_to_add_at_a_time)
+                to_add = self.dstore_keys[start:end].copy()
+                index.add_with_ids(torch.tensor(to_add.astype(np.float32)), torch.arange(start, end))
+                start += num_keys_to_add_at_a_time
 
-            if (start % 1000000) == 0:
-                logger.info(f'Added {start} tokens so far')
-                logger.info(f'Writing Index {start}')
-                faiss.write_index(index, f'{index_name}')
+                if (start % 1000000) == 0:
+                    logger.info(f'Added {start} tokens so far')
+                    logger.info(f'Writing Index {start}')
+                    faiss.write_index(index, f'{index_name}')
 
-        logger.info(f'Adding total {start} keys')
+            logger.info(f'Adding total {start} keys')
         logger.info(f'Adding took {time.time() - start_time} s')
         logger.info(f'Writing Index to {index_name}')
         start = time.time()
